@@ -3,8 +3,8 @@
 -- =========================================================
 
 local PANEL_X = 25
+local ROW_SPACING = 35 -- Ajustado para 30 para caber todos os 17 passos na tela confortavelmente
 local FIRST_ROW_Y = 100          
-local ROW_SPACING = 30 -- Ajustado para 30 para caber todos os 17 passos na tela confortavelmente
 
 local HANDLE_TEXT = "[ ARRASTAR AQUI ] Assistente de CaveBot"
 local HANDLE_COLOR = {0, 255, 0} -- Verde
@@ -37,8 +37,12 @@ local function hudGetPos(h)
 end
 
 local function createTextHUD(x, y, text, callback, isInfo)
-    local hudName = HUD.new(x, y, text)
-    -- Se for um botão de INFO, a cor será amarela para destacar que é uma instrução para você
+    -- Adicionamos colchetes e vários espaços em branco ao final para "esticar" a área do clique
+    local textoEsticado = string.format("[ %s ]           ", text)
+    
+    local hudName = HUD.new(x, y, textoEsticado)
+    
+    -- Se for um botão de INFO, a cor será amarela
     if isInfo then
         hudName:setColor(255, 215, 0)
     else
@@ -59,7 +63,7 @@ local builderNodes = {
     -- INSTRUÇÃO 1
     { name="3. INFO: Fazer Rota da Cave", type="info", content="Caminhe agora e grave os waypoints de toda a sua rota de caça." },
     
-    { name="4. Script: Check State", type="script", content='local lNeed, fNeed = false, false; pcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end end; f:close() end end); if lNeed or fNeed then CaveBot.GoTo("VOLTAR_SAFE") else CaveBot.GoTo("HUNT_START") end' },
+    { name="4. Script: Check State", type="script", content='local lNeed, fNeed = false, false; pcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end end; f:close() end end); if lNeed or fNeed then pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end); CaveBot.GoTo("VOLTAR_SAFE") else CaveBot.GoTo("HUNT_START") end' },
     { name="5. Label: VOLTAR_SAFE", type="label", content="VOLTAR_SAFE" },
     
     -- INSTRUÇÃO 2 (Adicionada conforme seu pedido)
@@ -67,7 +71,7 @@ local builderNodes = {
     
     { name="7. Script: Pausa 6s Chegada", type="script", content='print("Pausa 6s chegada"); wait(6000); pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end)' },
     { name="8. Label: AGUARDA_PARTY", type="label", content="AGUARDA_PARTY" },
-    { name="9. Script: Máquina de Estado", type="script", content='local lNeed, fNeed, isR, isFlw = false, false, false, false\npcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end; if d:sub(5,5)=="1" then isR=true end; if d:sub(7,7)=="1" then isFlw=true end end; f:close() end end)\nif lNeed and not fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end)\n    print("Só EU refilo. Kina fica no Safe.")\n    CaveBot.GoTo("IR_REFILL")\nelseif lNeed and fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Os dois refilam. Partiu loja.")\n    CaveBot.GoTo("IR_REFILL")\nelseif fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Aguardando Follower ir refilar...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelseif not isR then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end)\n    print("Aguardando Follower pisar no Safe Spot...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelseif not isFlw then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)\n    print("Aguardando Follower acionar o !follow...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelse\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)\n    print("Checklist OK! Esperando 6s por segurança para descer...")\n    wait(6000)\n    CaveBot.GoTo("VOLTAR_HUNT")\nend' },
+    { name="9. Script: Máquina de Estado", type="script", content='local lNeed, fNeed, isR, isFlw = false, false, false, false\npcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end; if d:sub(5,5)=="1" then isR=true end; if d:sub(7,7)=="1" then isFlw=true end end; f:close() end end)\nif not isR then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Aguardando todos chegarem no Safe Spot...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelseif lNeed and not fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Só EU refilo. Followers ficam no Safe.")\n    CaveBot.GoTo("IR_REFILL")\nelseif lNeed and fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Todos refilam. Partiu loja.")\n    CaveBot.GoTo("IR_REFILL")\nelseif fNeed then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)\n    print("Aguardando Follower ir refilar...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelseif not isFlw then\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)\n    print("Aguardando Follower dar !follow...")\n    wait(2000)\n    CaveBot.GoTo("AGUARDA_PARTY")\nelse\n    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)\n    print("Checklist OK! Descendo para hunt em 6s...")\n    wait(6000)\n    CaveBot.GoTo("VOLTAR_HUNT")\nend' },
     { name="10. Label: IR_REFILL", type="label", content="IR_REFILL" },
     
     -- INSTRUÇÃO 3 (Adicionada conforme seu pedido)

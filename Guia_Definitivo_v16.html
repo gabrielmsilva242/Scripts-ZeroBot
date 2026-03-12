@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+<meta charset="UTF-8">
+<title>Manual Definitivo CaveBot v17</title>
+<style>
+  body { background-color: #1e1e1e; color: #d4d4d4; font-family: 'Segoe UI', Tahoma, sans-serif; padding: 20px; line-height: 1.6; }
+  h1 { color: #569cd6; border-bottom: 2px solid #333; padding-bottom: 10px; text-align: center; }
+  h2 { color: #4ec9b0; margin-top: 40px; border-bottom: 1px solid #4ec9b0; padding-bottom: 5px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 15px; margin-bottom: 30px; background-color: #252526; }
+  th, td { border: 1px solid #444; padding: 12px; text-align: left; }
+  th { background-color: #333; color: #4ec9b0; }
+  .label-row { color: #d7ba7d; font-weight: bold; }
+  .script-row { color: #9cdcfe; }
+  .walk-row { color: #6a9955; font-style: italic; }
+  pre { background-color: #000; padding: 15px; border-radius: 5px; border: 1px solid #333; overflow-x: auto; }
+  code { color: #dcdcaa; }
+</style>
+</head>
+<body>
+
+<h1>Manual Definitivo CaveBot v17</h1>
+<p style="text-align: center;">Orquestração Híbrida: Follow Nativo Preferencial, Backup GPS e Radar de Quórum do Líder com Detecção de Morte.</p>
+
+<h2>📻 1. SCRIPTS DE RÁDIO (Aba Scripts)</h2>
+
+<h3>Rádio do FOLLOWER (role_follower_v19.lua)</h3>
+<pre><code>local Comms = require("PartySystem.lib_comms")
+
+local MY_NAME          = "Don Kina"
+local MY_VOC           = "EK" 
+local LEADER_NAME      = "Joaquim Quiabo"
+local TARGET_TO_FOLLOW = "Joaquim Quiabo"
+local LEADER_IP        = "26.131.131.149"
+local MY_PORT          = 45001
+local LEADER_PORT      = 45000
+
+-- OLHE A HUD NOVA PARA PEGAR SEU X, Y, Z E ATUALIZAR AQUI!
+local SAFE_POS      = { x = 33861, y = 30743, z = 7 }
+local POS_TOLERANCE = 5
+local CAP_MIN       = 100
+
+-- =============================================
+-- CONFIGURAÇÕES
+-- =============================================
+-- GPS de emergência: SOMENTE andar diferente OU dist absurda (>20 sqm mesmo andar)
+local GPS_DIST_EXTREME  = 20
+-- Safety net: re-envia !follow a cada ~3 minutos (900 ciclos x 200ms)
+local REFOLLOW_INTERVAL = 900
+
+-- =============================================
+-- MAPA DE FASES (a lógica INTEIRA depende disso)
+-- =============================================
+-- FOLLOW_PHASES → !follow ATIVO, cavebot OFF (ek segue o líder)
+-- ROUTE_PHASES  → !follow cancelado, cavebot ON (rota própria)
+-- Qualquer outra (STANDBY) → tudo desligado
+--
+-- SEM GEOFENCE. A fase dita tudo. Se o líder mandou HUNTING,
+-- o !follow fica ativo independente de onde o EK estiver.
+local FOLLOW_PHASES = { HUNTING = true, WAIT_SAFE = true }
+local ROUTE_PHASES  = { REFILL = true, VOLTAR_HUNT = true }
+
+local VOC_DATA = {
+    EM = { {name="Gt Mana", id=238, min=100}, {name="Ult Spirit", id=23374, min=100} },
+    EK = { {name="Str Mana", id=237, min=100}, {name="Sup Health", id=23375, min=100}, {name="Ult Health", id=7643, min=100} },
+    RP = { {name="Ult Spirit", id=23374, min=100}, {name="GFB", id=3191, min=100}, {name="Diam Arrow", id=35901, min=100} },
+    MS = { {name="Ult Mana", id=23373, min=100}, {name="GFB", id=3191, min=100} },
+    ED = { {name="Ult Mana", id=23373, min=100}, {name="GFB", id=3191, min=100} }
+}
+
+Comms.FollowerSetup(MY_PORT, LEADER_IP, LEADER_PORT)
+local myVoc = VOC_DATA[MY_VOC]
+
+pcall(function() local f = io.open("zb_follower_phase.txt", "w"); if f then f:write("STANDBY"); f:close() end end)
+_G.FollowerPhase = "STANDBY"
+
+-- =============================================
+-- FUNCOES UTILITARIAS
+-- =============================================
+local function getCapOz() local ok, v = pcall(Player.getCapacity); return (ok and v) and v / 100 or 0 end
+local function countItem(id) if not id then return 0 end local ok, v = pcall(Game.getItemCount, id); return ok and v or 0 end
+local function getPos() local ok, p = pcall(Map.getCameraPosition); return ok and p or { x = 0, y = 0, z = 0 } end
+local function nearPos(a, b, tol) if not a or not b or a.z ~= b.z then return false end return math.max(math.abs(a.x - b.x), math.abs(a.y - b.y)) <= (tol or 1) end
+
+local function getDistance(pos1, pos2)
+    if not pos1 or not pos2 then return 999 end
+    return math.max(math.abs(pos1.x - pos2.x), math.abs(pos1.y - pos2.y))
+end
+
+-- =============================================
+-- COMANDOS DE FOLLOW VIA CHAT
+-- =============================================
+local function sendFollow(targetName)
+    pcall(Player.stopAutoWalk)
+    pcall(Game.talk, "!follow " .. targetName, Enums.TalkTypes.TALKTYPE_SAY)
+end
+
+local function sendUnfollow()
+    pcall(Game.talk, "!follow", Enums.TalkTypes.TALKTYPE_SAY)
+end
+
+-- =============================================
+-- GPS EMERGÊNCIA → TILE ADJACENTE
+-- =============================================
+local function goToAdjacentTile(targetX, targetY, targetZ)
+    local myPos = getPos()
+    if myPos.z ~= targetZ then
+        pcall(Map.goTo, targetX, targetY, targetZ)
+        return
+    end
+
+    local dx = targetX - myPos.x
+    local dy = targetY - myPos.y
+    local adjX, adjY = targetX, targetY
+
+    if math.abs(dx) >= math.abs(dy) then
+        if dx > 0 then adjX = targetX - 1
+        elseif dx < 0 then adjX = targetX + 1 end
+    else
+        if dy > 0 then adjY = targetY - 1
+        elseif dy < 0 then adjY = targetY + 1 end
+    end
+
+    if adjX == targetX and adjY == targetY then
+        adjY = targetY + 1
+    end
+
+    pcall(Map.goTo, adjX, adjY, targetZ)
+end
+
+-- =============================================
+-- DETECÇÃO DE MORTE
+-- =============================================
+local function amIDead()
+    local ok, hp = pcall(Player.getHealth)
+    if ok and hp ~= nil and hp <= 0 then return true end
+    return false
+end
+
+local function needsRefill()
+    if getCapOz() < CAP_MIN then return true, "Cap" end
+    for _, item in ipairs(myVoc) do
+        if countItem(item.id) < item.min then return true, item.name end
+    end
+    return false, "OK"
+end
+
+local function saveCavebotPhase(phase)
+    pcall(function() local f = io.open("zb_follower_phase.txt", "w"); if f then f:write(phase); f:close() end end)
+end
+
+local function saveFollowerNeed(needR)
+    pcall(function() local f = io.open("zb_follower_need.txt", "w"); if f then f:write(needR and "1" or "0"); f:close() end end)
+end
+
+-- =============================================
+-- HUD
+-- =============================================
+local hudHandle = nil
+local function renderHud(isLost, needR, reason, followStatus, dist)
+    local myPos = getPos()
+    local text = string.format(
+        "[ FOLLOWER HUD v19 ]\nFase: %s\nPos: %d, %d, %d\nCaveBot: %s\nAcao: %s\nGPS Emerg: %s\nDist Lider: %d sqm\nAlvo: %s\nRefill: %s (%s)\n------------------\nCap: %.0f oz\n", 
+        _G.FollowerPhase, myPos.x, myPos.y, myPos.z,
+        ROUTE_PHASES[_G.FollowerPhase] and "ON (Rotas)" or "OFF",
+        followStatus,
+        isLost and "ATIVO" or "OFF",
+        dist,
+        TARGET_TO_FOLLOW,
+        needR and "SIM" or "NAO", reason, getCapOz()
+    )
+    for _, item in ipairs(myVoc) do text = text .. string.format("%s: %d\n", item.name, countItem(item.id)) end
+    if not hudHandle then hudHandle = HUD.new(10, 10, text, true); hudHandle:setDraggable(true) else hudHandle:setText(text) end
+    hudHandle:setColor(220, 220, 220)
+end
+
+-- =============================================
+-- VARIÁVEIS DE ESTADO
+-- =============================================
+print("[FOLLOWER v19] Fase dita tudo. Sem geofence. !follow + GPS emergencia.")
+local isFollowing    = false
+local gpsActive      = false
+local myPulse        = 0
+local cbState        = nil
+local lastPhase      = "STANDBY"
+local refollowTimer  = 0
+local isDead         = false
+local followStatus   = "NENHUM"
+
+-- =============================================
+-- LOOP PRINCIPAL
+-- =============================================
+while true do
+    myPulse = myPulse + 1
+    local st = Comms.FollowerReceive()
+    if st and st.phase then _G.FollowerPhase = st.phase end
+
+    local myPos  = getPos()
+    local isLost = false
+    isDead = amIDead()
+
+    -- Posição do líder via UDP
+    local leaderDist   = 999
+    local leaderFloor  = myPos.z
+    local hasLeaderPos = false
+    if st and st.leaderX and st.leaderY and st.leaderZ then
+        leaderDist   = getDistance(myPos, { x = st.leaderX, y = st.leaderY, z = st.leaderZ })
+        leaderFloor  = st.leaderZ
+        hasLeaderPos = true
+    end
+
+    local diffFloor   = (leaderFloor ~= myPos.z)
+    local extremeDist = (leaderDist > GPS_DIST_EXTREME and not diffFloor)
+
+    -- =========================================
+    -- BLOCO A: FASES DE FOLLOW (HUNTING / WAIT_SAFE)
+    -- =========================================
+    if FOLLOW_PHASES[_G.FollowerPhase] then
+
+        if not FOLLOW_PHASES[lastPhase] then
+            sendFollow(TARGET_TO_FOLLOW)
+            isFollowing   = true
+            gpsActive     = false
+            refollowTimer = 0
+            followStatus  = "!follow " .. TARGET_TO_FOLLOW
+        end
+
+        if diffFloor or extremeDist then
+            isLost = true
+
+            if not gpsActive then
+                sendUnfollow()
+                isFollowing = false
+                gpsActive   = true
+            end
+
+            followStatus = "GPS EMERGENCIA"
+
+            if hasLeaderPos then
+                goToAdjacentTile(st.leaderX, st.leaderY, st.leaderZ)
+            end
+        else
+            if gpsActive then
+                pcall(Player.stopAutoWalk)
+                sendFollow(TARGET_TO_FOLLOW)
+                gpsActive     = false
+                isFollowing   = true
+                refollowTimer = 0
+                followStatus  = "!follow " .. TARGET_TO_FOLLOW .. " (retomado)"
+            elseif not isFollowing then
+                sendFollow(TARGET_TO_FOLLOW)
+                isFollowing   = true
+                refollowTimer = 0
+                followStatus  = "!follow " .. TARGET_TO_FOLLOW
+            else
+                refollowTimer = refollowTimer + 1
+                if refollowTimer >= REFOLLOW_INTERVAL then
+                    sendFollow(TARGET_TO_FOLLOW)
+                    refollowTimer = 0
+                    followStatus = "!follow " .. TARGET_TO_FOLLOW .. " (refresh)"
+                end
+            end
+        end
+
+        if cbState ~= false then pcall(Engine.enableCaveBot, false); cbState = false end
+
+    -- =========================================
+    -- BLOCO B: FASES DE ROTA (REFILL)
+    -- =========================================
+    elseif ROUTE_PHASES[_G.FollowerPhase] then
+        if isFollowing then
+            sendUnfollow()
+            isFollowing = false
+        end
+        if gpsActive then
+            pcall(Player.stopAutoWalk)
+            gpsActive = false
+        end
+        refollowTimer = 0
+        followStatus  = "ROTA CAVEBOT"
+        if cbState ~= true then pcall(Engine.enableCaveBot, true); cbState = true end
+
+    -- =========================================
+    -- BLOCO C: STANDBY
+    -- =========================================
+    else
+        if isFollowing then
+            sendUnfollow()
+            isFollowing = false
+        end
+        if gpsActive then
+            pcall(Player.stopAutoWalk)
+            gpsActive = false
+        end
+        refollowTimer = 0
+        followStatus  = "PARADO (STANDBY)"
+        cbState       = nil
+    end
+
+    lastPhase = _G.FollowerPhase
+
+    -- =========================================
+    -- COMUNICAÇÃO
+    -- =========================================
+    saveCavebotPhase(_G.FollowerPhase)
+    local needR, reason = needsRefill()
+    saveFollowerNeed(needR)
+    
+    Comms.FollowerSendToLeader({ 
+        from = MY_NAME, needsRefill = needR, reason = reason,
+        atSafe = nearPos(getPos(), SAFE_POS, POS_TOLERANCE),
+        cap = getCapOz(), fPhase = _G.FollowerPhase,
+        isFollowing = isFollowing, isLost = isLost, pulse = myPulse,
+        isDead = isDead
+    })
+    
+    renderHud(isLost, needR, reason, followStatus, leaderDist)
+    wait(200)
+end
+</code></pre>
+
+<h3>Rádio do LÍDER (role_leader_v17.lua)</h3>
+<pre><code>local Comms = require("PartySystem.lib_comms")
+
+local MY_PORT = 45000
+local LEADER_VOC = "EM" 
+local FOLLOWERS = { 
+    { name = "Don Kina", ip = "127.0.0.1", port = 45001 }, 
+    -- Descomente as linhas abaixo quando eles forem participar!
+    --{ name = "Clt Anthera", ip = "26.131.131.149", port = 45003 }, 
+    --{ name = "Nick Invalido", ip = "26.131.131.149", port = 45002 }
+}
+
+-- OLHE A HUD NOVA PARA PEGAR SEU X, Y, Z E ATUALIZAR AQUI!
+local SAFE_POS      = { x = 33861, y = 30743, z = 7 }
+local POS_TOLERANCE = 5
+local CAP_MIN       = 100
+
+-- =============================================
+-- CONFIGURACOES DO SISTEMA DE EMERGENCIA
+-- =============================================
+local OFFLINE_TIMEOUT      = 12
+local DEATH_CONFIRM_DELAY  = 3
+
+local VOC_DATA = {
+    EM = { {name="Gt Mana", id=238, min=100}, {name="Ult Spirit", id=23374, min=100} },
+    EK = { {name="Str Mana", id=237, min=100}, {name="Sup Health", id=23375, min=100}, {name="Ult Health", id=7643, min=100} },
+    RP = { {name="Gt Mana", id=238, min=100}, {name="Ult Spirit", id=23374, min=100}, {name="GFB", id=3191, min=100}, {name="Diam Arrow", id=35091, min=100} },
+    MS = { {name="Ult Mana", id=23373, min=100}, {name="Avalanche", id=3161, min=100} },
+    ED = { {name="Ult Mana", id=23373, min=100}, {name="Avalanche", id=3161, min=100} }
+}
+
+Comms.LeaderSetup(MY_PORT)
+local myVoc = VOC_DATA[LEADER_VOC]
+
+pcall(function() local f = io.open("zb_leader_phase.txt", "w"); if f then f:write("STANDBY"); f:close() end end)
+_G.LeaderPhase = "STANDBY"
+
+local flags = {}
+for _, f in ipairs(FOLLOWERS) do 
+    flags[f.name] = { 
+        needs_refill = false, at_safe = false, is_following = false, 
+        is_lost = false, is_dead = false, last_seen = 0, cap = 0, 
+        reason = "OK", fPhase = "STANDBY", last_pulse = 0,
+        dead_since = 0 
+    } 
+end
+
+local function getCapOz() local ok, v = pcall(Player.getCapacity); return (ok and v) and v / 100 or 0 end
+local function countItem(id) if not id then return 0 end local ok, v = pcall(Game.getItemCount, id); return ok and v or 0 end
+local function getPos() local ok, p = pcall(Map.getCameraPosition); return ok and p or { x = 0, y = 0, z = 0 } end
+local function nearPos(a, b, tol) if not a or not b or a.z ~= b.z then return false end return math.max(math.abs(a.x - b.x), math.abs(a.y - b.y)) <= (tol or 1) end
+
+local function leaderNeedsRefill()
+    if getCapOz() < CAP_MIN then return true, "Cap" end
+    for _, item in ipairs(myVoc) do if countItem(item.id) < item.min then return true, item.name end end
+    return false, "OK"
+end
+
+local function saveCavebotState(lNeed, fNeed, isR, isFlw)
+    pcall(function() local f = io.open("zb_leader_state.txt", "w"); if f then f:write((lNeed and "1" or "0") .. "," .. (fNeed and "1" or "0") .. "," .. (isR and "1" or "0") .. "," .. (isFlw and "1" or "0")); f:close() end end)
+end
+
+local function readCavebotPhase()
+    pcall(function() local f = io.open("zb_leader_phase.txt", "r"); if f then local p = f:read("*a"); if p and p ~= "" then _G.LeaderPhase = p end; f:close() end end)
+end
+
+local function forcePhase(newPhase)
+    _G.LeaderPhase = newPhase
+    pcall(function() local f = io.open("zb_leader_phase.txt", "w"); if f then f:write(newPhase); f:close() end end)
+end
+
+local hudHandle = nil
+local function renderHud(lNeed, fNeed, allAtSafe, allFollowing, emergencyActive)
+    local _, reason = leaderNeedsRefill()
+    local myPos = getPos()
+    
+    local smText = ">>> MÁQUINA DE ESTADO <<<\n"
+    smText = smText .. string.format("- Lider quer loja? %s (%s)\n", lNeed and "SIM" or "NAO", reason)
+    smText = smText .. string.format("- Kina quer loja?  %s\n", fNeed and "SIM" or "NAO")
+    smText = smText .. string.format("- Todos no Safe?   %s\n", allAtSafe and "SIM" or "NAO")
+    smText = smText .. string.format("- Kina deu Follow? %s\n", allFollowing and "SIM" or "NAO")
+    if emergencyActive then
+        smText = smText .. "- !! EMERGENCIA !!  SIM\n"
+    end
+
+    local text = string.format("[ LEADER HUD v17 ]\nFase Ditada: %s\nPos Atual: %d, %d, %d\n------------------\n%s------------------\nCap: %.0f oz\n", 
+        _G.LeaderPhase, myPos.x, myPos.y, myPos.z, smText, getCapOz())
+        
+    for _, item in ipairs(myVoc) do text = text .. string.format("%s: %d\n", item.name, countItem(item.id)) end
+    
+    text = text .. "------------------\n[ FOLLOWERS ]"
+    for _, f in ipairs(FOLLOWERS) do
+        local fl = flags[f.name]; local isOnline = (os.time() - fl.last_seen) < OFFLINE_TIMEOUT
+        local alerta = "[OK]"
+        if fl.is_dead then alerta = "[MORTO!!!]"
+        elseif not isOnline then alerta = "[OFFLINE/FECHADO]" 
+        elseif fl.is_lost then alerta = "[PERDIDO/GPS ON]" end
+        
+        text = text .. string.format("\n- %s: %s\n  Sfe:%s | Flw:%s | Ref:%s | Dead:%s", 
+            f.name, alerta, fl.at_safe and "S" or "N", fl.is_following and "S" or "N", 
+            fl.needs_refill and "S" or "N", fl.is_dead and "S" or "N")
+    end
+    
+    if not hudHandle then hudHandle = HUD.new(10, 10, text, true); hudHandle:setDraggable(true) else hudHandle:setText(text) end
+    hudHandle:setColor(220, 220, 220)
+end
+
+print("[LEADER v17] Radio HUD + Pos Tracker + Detecção de Morte + Emergência.")
+local radarBraked       = false
+local emergencyActive   = false  
+local emergencyTimer    = 0      
+
+while true do
+    readCavebotPhase()
+
+    for _, f in ipairs(FOLLOWERS) do
+        local pkt = Comms.LeaderReceiveFrom(f.name)
+        if pkt and pkt.from and flags[pkt.from] and pkt.pulse ~= flags[pkt.from].last_pulse then 
+            local fl = flags[pkt.from]
+            fl.needs_refill = pkt.needsRefill
+            fl.at_safe      = pkt.atSafe
+            fl.is_following = pkt.isFollowing
+            fl.is_lost      = pkt.isLost
+            fl.last_seen    = os.time()
+            fl.last_pulse   = pkt.pulse
+
+            if pkt.isDead then
+                if not fl.is_dead then
+                    fl.is_dead = true
+                    fl.dead_since = os.time()
+                end
+            else
+                if fl.is_dead then
+                    fl.is_dead = false
+                    fl.dead_since = 0
+                end
+            end
+        end
+    end
+
+    local lNeed = leaderNeedsRefill()
+    local fNeed, allAtSafe, allFollowing, anyLost, anyDead = false, nearPos(getPos(), SAFE_POS, POS_TOLERANCE), true, false, false
+
+    for _, f in ipairs(FOLLOWERS) do
+        local fl = flags[f.name]
+        local isOnline = (os.time() - fl.last_seen) < OFFLINE_TIMEOUT
+
+        if fl.is_dead then
+            anyDead = true
+        end
+
+        if isOnline and not fl.is_dead then 
+            if fl.needs_refill then fNeed = true end
+            if not fl.at_safe then allAtSafe = false end
+            if not fl.is_following then allFollowing = false end
+            if fl.is_lost then anyLost = true end
+        elseif not isOnline then
+            allAtSafe = false; allFollowing = false; anyLost = true
+            if _G.LeaderPhase == "HUNTING" and fl.last_seen > 0 then
+                anyDead = true
+            end
+        end
+    end
+
+    if anyDead and _G.LeaderPhase == "HUNTING" and not emergencyActive then
+        emergencyActive = true
+        emergencyTimer  = os.time()
+        forcePhase("WAIT_SAFE")
+    end
+
+    if emergencyActive and not anyDead and allAtSafe then
+        emergencyActive = false
+        emergencyTimer  = 0
+    end
+
+    if _G.LeaderPhase == "HUNTING" then
+        if anyLost or anyDead then
+            if not radarBraked then 
+                pcall(Engine.enableCaveBot, false)
+                radarBraked = true
+            end
+        else
+            if radarBraked then pcall(Engine.enableCaveBot, true); radarBraked = false end
+        end
+    else
+        if radarBraked then radarBraked = false end
+    end
+
+    saveCavebotState(lNeed, fNeed, allAtSafe, allFollowing)
+    Comms.LeaderBroadcast(FOLLOWERS, { 
+        phase   = _G.LeaderPhase, 
+        leaderX = getPos().x, 
+        leaderY = getPos().y, 
+        leaderZ = getPos().z 
+    })
+    renderHud(lNeed, fNeed, allAtSafe, allFollowing, emergencyActive)
+    wait(200)
+end
+</code></pre>
+
+<hr>
+
+<h2>👑 2. CAVEBOT DO LÍDER (Com Checklist e Correção do Teleport)</h2>
+<p><i>Nota: A lógica de Cavebot foi aprimorada para avisar o Rádio do Refill <b>antes</b> de iniciar o trajeto para o Safe Spot.</i></p>
+
+<table>
+  <tr><th>#</th><th>Tipo</th><th>Nome / Ação</th></tr>
+  <tr class="label-row"><td>1</td><td>Label</td><td>HUNT_START</td></tr>
+  <tr class="script-row"><td>2</td><td>Script</td><td>pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)</td></tr>
+  <tr class="walk-row"><td>3</td><td>Walk</td><td>[Caminhada de Caça inteira]</td></tr>
+  <tr class="script-row"><td>4</td><td>Script</td><td>
+<pre><code>local lNeed, fNeed = false, false; pcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end end; f:close() end end);
+if lNeed or fNeed then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end)
+    CaveBot.GoTo("VOLTAR_SAFE")
+else
+    CaveBot.GoTo("HUNT_START")
+end</code></pre>
+  </td></tr>
+  <tr class="label-row"><td>5</td><td>Label</td><td>VOLTAR_SAFE</td></tr>
+  <tr class="walk-row"><td>6</td><td>Walk</td><td>[Caminhada do fim da cave até o Safe Spot]</td></tr>
+  <tr class="script-row"><td>7</td><td>Script</td><td>print("Pausa 6s chegada"); wait(6000); pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("WAIT_SAFE") f:close() end)</td></tr>
+  <tr class="label-row"><td>8</td><td>Label</td><td>AGUARDA_PARTY</td></tr>
+  <tr class="script-row"><td>9</td><td>Script</td><td>
+<pre><code>local lNeed, fNeed, isR, isFlw = false, false, false, false
+pcall(function() local f=io.open("zb_leader_state.txt","r"); if f then local d=f:read("*a"); if d then if d:sub(1,1)=="1" then lNeed=true end; if d:sub(3,3)=="1" then fNeed=true end; if d:sub(5,5)=="1" then isR=true end; if d:sub(7,7)=="1" then isFlw=true end end; f:close() end end)
+
+if not isR then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)
+    print("Aguardando todos chegarem no Safe Spot...")
+    wait(2000)
+    CaveBot.GoTo("AGUARDA_PARTY")
+elseif lNeed and not fNeed then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)
+    print("Só EU refilo. Followers ficam no Safe.")
+    CaveBot.GoTo("IR_REFILL")
+elseif lNeed and fNeed then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)
+    print("Todos refilam. Partiu loja.")
+    CaveBot.GoTo("IR_REFILL")
+elseif fNeed then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("REFILL") f:close() end)
+    print("Aguardando Follower ir refilar...")
+    wait(2000)
+    CaveBot.GoTo("AGUARDA_PARTY")
+elseif not isFlw then
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)
+    print("Aguardando Follower dar !follow...")
+    wait(2000)
+    CaveBot.GoTo("AGUARDA_PARTY")
+else
+    pcall(function() local f=io.open("zb_leader_phase.txt","w") f:write("HUNTING") f:close() end)
+    print("Checklist OK! Descendo para hunt em 6s...")
+    wait(6000)
+    CaveBot.GoTo("VOLTAR_HUNT")
+end</code></pre>
+  </td></tr>
+  <tr class="label-row"><td>10</td><td>Label</td><td>IR_REFILL</td></tr>
+  <tr class="walk-row"><td>11</td><td>Walk</td><td>[Caminhada do Safe até a loja e DE VOLTA pro Safe Spot]</td></tr>
+  <tr class="script-row"><td>12</td><td>Script</td><td>print("Voltei da Loja."); CaveBot.GoTo("AGUARDA_PARTY")</td></tr>
+  <tr class="label-row"><td>13</td><td>Label</td><td>VOLTAR_HUNT</td></tr>
+  <tr class="walk-row"><td>14</td><td>Walk</td><td>[Caminhada do Safe Spot até o buraco da cave]</td></tr>
+  <tr class="script-row"><td>15</td><td>Script</td><td>CaveBot.GoTo("HUNT_START")</td></tr>
+</table>
+
+<hr>
+
+<h2>🛡️ 3. CAVEBOT DO FOLLOWER</h2>
+<p><i>Nota: A lógica de Cavebot permanece funcional, agindo apenas durante o percurso da loja ou na desconexão.</i></p>
+
+<table>
+  <tr><th>#</th><th>Tipo</th><th>Nome / Ação</th></tr>
+  <tr class="label-row"><td>1</td><td>Label</td><td>HUNT_IDLE</td></tr>
+  <tr class="script-row"><td>2</td><td>Script</td><td>local phase = "UNKNOWN"; pcall(function() local f=io.open("zb_follower_phase.txt","r"); if f then phase=f:read("*a"); f:close() end end); if phase=="HUNTING" or phase=="UNKNOWN" then wait(1000); CaveBot.GoTo("HUNT_IDLE") else CaveBot.GoTo("VOLTAR_SAFE") end</td></tr>
+  <tr class="label-row"><td>3</td><td>Label</td><td>VOLTAR_SAFE</td></tr>
+  <tr class="walk-row"><td>4</td><td>Walk</td><td>[Caminhada da cave até o Safe Spot]</td></tr>
+  <tr class="script-row"><td>5</td><td>Script</td><td>print("Pausa 6s chegada"); wait(6000)</td></tr>
+  <tr class="label-row"><td>6</td><td>Label</td><td>AT_SAFE</td></tr>
+  <tr class="script-row"><td>7</td><td>Script</td><td>local phase = "UNKNOWN"; pcall(function() local f=io.open("zb_follower_phase.txt","r"); if f then phase=f:read("*a"); f:close() end end); local myNeed = false; pcall(function() local f=io.open("zb_follower_need.txt","r"); if f then if f:read("*a")=="1" then myNeed=true end; f:close() end end); if phase=="HUNTING" then CaveBot.GoTo("HUNT_IDLE") elseif phase=="REFILL" and myNeed then CaveBot.GoTo("FAZER_REFILL") else wait(1000); CaveBot.GoTo("AT_SAFE") end</td></tr>
+  <tr class="label-row"><td>8</td><td>Label</td><td>FAZER_REFILL</td></tr>
+  <tr class="walk-row"><td>9</td><td>Walk</td><td>[Caminhada do Safe Spot até a loja e DE VOLTA pro Safe Spot]</td></tr>
+  <tr class="script-row"><td>10</td><td>Script</td><td>print("Terminei a loja. Voltando ao loop de safe."); CaveBot.GoTo("AT_SAFE")</td></tr>
+</table>
+
+</body>
+</html>
